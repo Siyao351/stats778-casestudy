@@ -1,0 +1,10 @@
+---
+title: "stats778-casestudy"
+output: html_document
+date: "2025-04-09"
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+```
+

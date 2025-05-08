@@ -228,7 +228,6 @@ coverage_df <- do.call(rbind, lapply(names(coverage_results), function(name) {
   df
 })) %>%
   relocate(Setting, Coefficient)
-
 print(coverage_df)
 ```
 

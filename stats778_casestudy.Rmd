@@ -3,8 +3,402 @@ title: "stats778-casestudy"
 output: html_document
 date: "2025-04-09"
 ---
-
+# Load required library
 ```{r}
-knitr::opts_chunk$set(echo = TRUE)
+library(MASS)  # for mvrnorm
+library(quantreg)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+```
+
+# Data generation
+```{r}
+simulate_cluster <- function(cluster_id, cluster_size, beta, rho = 0.5) {
+  p <- length(beta)
+  X <- matrix(rnorm(cluster_size * p), ncol = p)
+  colnames(X) <- paste0("X", 1:p)
+  
+  Sigma <- matrix(rho, cluster_size, cluster_size)
+  diag(Sigma) <- 1
+  error_raw <- mvrnorm(n = 1, mu = rep(0, cluster_size), Sigma = Sigma)
+  error_star <- error_raw - median(error_raw)
+  
+  Y <- X %*% beta + error_star
+  data.frame(cluster_id = cluster_id, Y = as.vector(Y), X, error_star)
+}
+
+set.seed(123)
+n_clusters <- 30
+beta_true <- c(0.5, 1, 1.5, 2, -1)
+rho <- 0.5
+
+cluster_sizes <- c(20, 20, 20, 20, 100, 20, 100, 100, 20, 20, 
+                   100, 100, 100, 100, 20, 100, 20, 20, 100, 100,
+                   20, 100, 20, 100, 20, 100, 20, 100, 20, 100)
+
+#  Generate all clusters 
+data <- do.call(rbind, lapply(1:n_clusters, function(i) {
+  simulate_cluster(i, cluster_sizes[i], beta = beta_true, rho = rho)
+}))
+
+write_csv(data, "data.csv")
+```
+
+# Quantile regression
+```{r}
+# Fit baseline quantile regression ---
+tau <- 0.5
+formula_qr <- Y ~ X1 + X2 + X3 + X4 + X5
+
+# Estimate quantile regression 
+model_qr <- rq(formula_qr, data = data, tau = tau)
+beta_hat <- coef(model_qr)
+```
+
+
+# Wild gradient bootstrap
+```{r}
+rMammen <- function(n) {
+  p <- (sqrt(5) + 1) / (2 * sqrt(5))
+  u <- runif(n)
+  ifelse(u < p, -(sqrt(5) - 1)/2, (sqrt(5) + 1)/2)
+}
+
+cluster_ids <- unique(data$cluster_id)
+n_clusters <- length(cluster_ids)
+W <- rMammen(n_clusters)
+
+# Compute bootstrap gradient Wn(tau) 
+compute_Wn <- function(data, model, tau, W) {
+  grad <- rep(0, length(coef(model)))
+  for (i in seq_along(cluster_ids)) {
+    cluster_data <- data[data$cluster_id == cluster_ids[i], ]
+    psi_vals <- tau - as.numeric(cluster_data$Y < predict(model, newdata = cluster_data))
+    X_mat <- model.matrix(model, data = cluster_data)
+    grad <- grad + W[i] * colSums(psi_vals * X_mat)
+  }
+  grad / sqrt(n_clusters)
+}
+
+Wn_tau <- compute_Wn(data, model_qr, tau, W)
+
+X_star <- -sqrt(n_clusters) * Wn_tau / tau
+Y_star <- max(data$Y) * 10
+X_names <- names(beta_hat)[-1]  # exclude intercept
+synthetic_row <- data.frame(matrix(X_star[-1], nrow = 1))
+colnames(synthetic_row) <- X_names
+synthetic_row$Y <- Y_star
+synthetic_row$cluster <- max(data$cluster_id) + 1
+
+augmented_data <- bind_rows(data, synthetic_row)
+model_star <- rq(formula_qr, data = augmented_data, tau = tau)
+
+wild_gradient_bootstrap <- function(data, model, tau, B = 500) {
+  cluster_ids <- unique(data$cluster_id)
+  n_clusters <- length(cluster_ids)
+  beta_hat <- coef(model)
+  results <- matrix(NA, nrow = B, ncol = length(beta_hat))
+  colnames(results) <- names(beta_hat)
+  
+  for (b in 1:B) {
+    W <- rMammen(n_clusters)
+    Wn_tau <- compute_Wn(data, model, tau, W)
+    X_star <- -sqrt(n_clusters) * Wn_tau / tau
+    Y_star <- max(data$Y) * 10
+    
+    X_names <- names(beta_hat)[-1]
+    synthetic_row <- data.frame(matrix(X_star[-1], nrow = 1))
+    colnames(synthetic_row) <- X_names
+    synthetic_row$Y <- Y_star
+    synthetic_row$cluster <- max(data$cluster_id) + 1
+    
+    augmented_data <- bind_rows(data, synthetic_row)
+    model_star <- rq(formula_qr, data = augmented_data, tau = tau)
+    results[b, ] <- coef(model_star)
+  }
+  return(results)
+}
+```
+
+
+
+# standard boostrap 
+```{r}
+# Define a function to compute bootstrap estimates
+standard_bootstrap_qr <- function(data, formula_qr, tau = tau, B = B, seed = 123) {
+  n <- nrow(data)
+  boot_coefs <- matrix(NA, nrow = B, ncol = length(coef(rq(formula_qr, data = data, tau = tau))))
+  
+  for (b in 1:B) {
+    boot_indices <- sample(1:n, size = n, replace = TRUE)
+    boot_data <- data[boot_indices, ]
+    boot_model <- rq(formula_qr, data = boot_data, tau = tau)
+    boot_coefs[b, ] <- coef(boot_model)
+  }
+  
+  colnames(boot_coefs) <- names(coef(boot_model))
+  return(boot_coefs)
+}
+```
+
+
+# Calculate coverage rate for two methods
+```{r}
+# caluclate coverage rate for wgb and standard boostrap for single tau and rho value
+evaluate_coverage <- function(n_sim = 100, B = 500, tau = 0.5, rho = 0.5,
+                              beta_true = c(0.5, 1, 1.5, 2, -1)) {
+  formula_qr <- Y ~ X1 + X2 + X3 + X4 + X5
+  coef_names <- paste0("X", 1:length(beta_true))
+  
+  coverage_counts <- matrix(0, nrow = length(beta_true), ncol = 2)
+  colnames(coverage_counts) <- c("WGB", "Standard")
+  rownames(coverage_counts) <- coef_names
+  
+  for (sim in 1:n_sim) {
+    # Simulate data 
+    cluster_sizes <- c(20, 20, 20, 20, 100, 20, 100, 100, 20, 20, 
+                       100, 100, 100, 100, 20, 100, 20, 20, 100, 100,
+                       20, 100, 20, 100, 20, 100, 20, 100, 20, 100)
+    data_co <- do.call(rbind, lapply(1:30, function(i) {
+      simulate_cluster(i, cluster_sizes[i], beta_true, rho)
+    }))
+    
+    # Base QR fit 
+    formula <- Y ~ X1 + X2 + X3 + X4 + X5
+    model <- rq(formula, data = data_co, tau = tau)
+    
+    # WGB 
+    coef_wgb <- wild_gradient_bootstrap(data_co, model, tau, B)
+    ci_lower_wgb <- apply(coef_wgb, 2, quantile, 0.025)
+    ci_upper_wgb <- apply(coef_wgb, 2, quantile, 0.975)
+    
+    # Standard Bootstrap 
+    coefs_standard <- standard_bootstrap_qr(data_co, model, tau, B)
+    ci_lower_standard <- apply(coefs_standard, 2, quantile, probs = 0.025)
+    ci_upper_standard <- apply(coefs_standard, 2, quantile, probs = 0.975)
+    
+    # Check coverage (skip intercept) 
+    for (j in 1:length(beta_true)) {
+      idx <- j + 1  # skip intercept
+      # WGB
+      if (beta_true[j] >= ci_lower_wgb[idx] && beta_true[j] <= ci_upper_wgb[idx]) {
+        coverage_counts[j, "WGB"] <- coverage_counts[j, "WGB"] + 1
+      }
+      # Standard
+      if (beta_true[j] >= ci_lower_standard[idx] && beta_true[j] <= ci_upper_standard[idx]) {
+        coverage_counts[j, "Standard"] <- coverage_counts[j, "Standard"] + 1
+      }
+    }
+  }
+  
+  # Return empirical coverage rates
+  round(coverage_counts / n_sim, 5)
+}
+
+# combine coverage rate for wgb and standard boostrap for different tau and rho values
+# Define quantile levels and correlation values
+taus <- c(0.1, 0.5, 0.9)
+rhos <- c(0.1, 0.5, 0.9)
+
+# Storage list for results
+coverage_results <- list()
+
+# Loop through all tau and rho combinations
+for (tau_val in taus) {
+  for (rho_val in rhos) {
+    message(paste("Running coverage for tau =", tau_val, ", rho =", rho_val))
+    
+    # Run evaluation
+    result <- evaluate_coverage(n_sim = 100, B = 500, tau = tau_val, rho = rho_val)
+    
+    # Store with descriptive name
+    key <- paste0("tau_", tau_val, "_rho_", rho_val)
+    coverage_results[[key]] <- result
+  }
+}
+
+
+# Flatten the list into a data frame
+coverage_df <- do.call(rbind, lapply(names(coverage_results), function(name) {
+  df <- as.data.frame(coverage_results[[name]])
+  df$Coefficient <- rownames(df)
+  df$Setting <- name
+  df
+})) %>%
+  relocate(Setting, Coefficient)
+
+print(coverage_df)
+```
+
+# Plot the coverage rate for two methods.
+```{r}
+# Split into 3 tables by tau
+coverage_tau_01 <- coverage_df %>% filter(grepl("tau_0.1", Setting))
+coverage_tau_05 <- coverage_df %>% filter(grepl("tau_0.5", Setting))
+coverage_tau_09 <- coverage_df %>% filter(grepl("tau_0.9", Setting))
+
+# plot the coverage rate for two methods across different tau and rho values
+coverage_long <- coverage_df %>%
+  pivot_longer(cols = c("WGB", "Standard"),
+               names_to = "Method", values_to = "Coverage")
+plot_coverage_by_tau <- function(tau_value) {
+  df_plot <- coverage_long %>%
+    filter(grepl(paste0("tau_", tau_value), Setting)) %>%
+    filter(!is.na(Coverage))  
+  
+  ggplot(df_plot, aes(x = Coefficient, y = Coverage, fill = Method)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    geom_hline(aes(yintercept = 0.95, linetype = "95% Target"), color = "darkred", size = 1) +
+    scale_linetype_manual(name = NULL, values = c("95% Target" = "dashed")) +
+    coord_cartesian(ylim = c(0.85, 1)) +
+    facet_wrap(~ Setting, ncol = 3) +
+    labs(
+      title = paste("Coverage Rate Comparison at Tau =", tau_value),
+      y = "Coverage Rate",
+      x = "Coefficient",
+      fill = "Method"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      legend.position = "right"
+    )
+}
+
+
+plot_coverage_by_tau("0.1")
+plot_coverage_by_tau("0.5")
+plot_coverage_by_tau("0.9")
+```
+
+# combine calculate the whole tau and rho values for wild gradient bootstrap and standard bootstrap
+```{r}
+# Quantile levels and correlations
+taus <- c(0.1, 0.5, 0.9)
+rhos <- c(0.1, 0.5, 0.9)
+B     <- 500
+
+# Store results
+results_list <- list()
+
+for (tau in taus) {
+  for (rho in rhos) {
+    # Simulate data with this rho
+    set.seed(123)
+    data <- do.call(rbind, lapply(1:length(cluster_sizes), function(i) {
+      simulate_cluster(i, cluster_sizes[i], beta = beta_true, rho = rho)
+    }))
+    
+    # Fit baseline model
+    model_qr <- rq(formula_qr, data = data, tau = tau)
+    beta_hat <- coef(model_qr)
+    
+    # Wild Gradient Bootstrap 
+    wgb_coefs <- wild_gradient_bootstrap(data, model_qr, tau, B)
+    wgb_bias <- colMeans(wgb_coefs) - beta_true
+    wgb_se <- apply(wgb_coefs, 2, sd)
+    wgb_ci <- t(apply(wgb_coefs, 2, quantile, probs = c(0.025, 0.975)))
+    
+    wgb_df <- data.frame(
+      Method = "WGB",
+      tau = tau,
+      rho = rho,
+      Coefficient = names(beta_hat),
+      Estimate = beta_hat,
+      Bias = wgb_bias,
+      SE = wgb_se,
+      CI_width = wgb_ci[,2] - wgb_ci[,1],
+      CI_lower = wgb_ci[,1],
+      CI_upper = wgb_ci[,2]
+    )
+    
+    # Standard Bootstrap 
+    standard_coefs <- standard_bootstrap_qr(data, model_qr, tau, B)
+    standard_bias <- colMeans(standard_coefs) - beta_true
+    standard_se <- apply(standard_coefs, 2, sd)
+    standard_ci <- t(apply(standard_coefs, 2, quantile, probs = c(0.025, 0.975)))
+    
+    standard_df <- data.frame(
+      Method = "Standard",
+      tau = tau,
+      rho = rho,
+      Coefficient = names(beta_hat),
+      Estimate = beta_hat,
+      Bias = standard_bias,
+      SE = standard_se,
+      CI_width = standard_ci[,2] - standard_ci[,1],
+      CI_lower = standard_ci[,1],
+      CI_upper = standard_ci[,2]
+    )
+    
+    # Combine and store
+    results_list[[paste0("tau_", tau, "_rho_", rho)]] <- rbind(wgb_df, standard_df)
+  }
+}
+# Combine all into one data frame
+final_results <- do.call(rbind, results_list)
+print(final_results)
+```
+
+
+# figure bias for two methods across different tau and rho values
+```{r}
+for (tau_val in unique(final_results$tau)) {
+  df <- subset(final_results, tau == tau_val)
+  
+  p <- ggplot(df, aes(x = rho, y = Bias, color = Method, group = Method)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 2) +
+    facet_wrap(~ Coefficient, nrow = 2, scales = "free_y") +
+    labs(title = paste("Bias Comparison across rho at tau =", tau_val),
+         x = "Intra-cluster correlation (rho)", y = "Bias") +
+    scale_x_continuous(breaks = sort(unique(df$rho))) +
+    theme_minimal() +
+    theme(strip.text = element_text(size = 10, face = "bold"))
+  
+  print(p)
+}
+```
+
+
+# figure SE for two methods across different tau and rho values
+```{r}
+for (tau_val in unique(final_results$tau)) {
+  df <- subset(final_results, tau == tau_val)
+  
+  p <- ggplot(df, aes(x = rho, y = SE, color = Method, group = Method)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 2) +
+    facet_wrap(~ Coefficient, nrow = 2, scales = "free_y") +
+    labs(title = paste("SE Comparison across rho at tau =", tau_val),
+         x = "Intra-cluster correlation (rho)", y = "Standard Error") +
+    scale_x_continuous(breaks = sort(unique(df$rho))) +
+    theme_minimal() +
+    theme(strip.text = element_text(size = 10, face = "bold"))
+  
+  print(p)
+}
+```
+
+
+# figure CI width for two methods across different tau and rho values
+```{r}
+for (tau_val in unique(final_results$tau)) {
+  df <- subset(final_results, tau == tau_val)
+  
+  p <- ggplot(df, aes(x = rho, y = CI_width, color = Method, group = Method)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 2) +
+    facet_wrap(~ Coefficient, nrow = 2, scales = "free_y") +
+    labs(title = paste("CI_width Comparison across rho at tau =", tau_val),
+         x = "Intra-cluster correlation (rho)", y = "CI_width") +
+    scale_x_continuous(breaks = sort(unique(df$rho))) +
+    theme_minimal() +
+    theme(strip.text = element_text(size = 10, face = "bold"))
+  
+  print(p)
+}
 ```
 
